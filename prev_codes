@@ -1,0 +1,1610 @@
+1. api.py:
+
+"""
+api.py
+──────
+FastAPI endpoint for the Contract Intelligence Pipeline.
+
+Accepts file uploads, runs the full pipeline asynchronously,
+and returns generated NDA and SOW PDFs for download.
+
+Usage (local):
+    pip install fastapi uvicorn python-multipart
+    python api.py
+
+Then open: http://localhost:8000/docs  (interactive API docs)
+
+Endpoints:
+    POST /analyze          — upload file, get job_id back
+    GET  /jobs/{job_id}    — check status, get download URLs when ready
+    GET  /download/{job_id}/nda  — download NDA PDF
+    GET  /download/{job_id}/sow  — download SOW PDF
+    GET  /health           — health check
+"""
+
+import logging
+import os
+import shutil
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Literal
+
+import uvicorn
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, Form, HTTPException, Security, UploadFile, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.security.api_key import APIKeyHeader
+from slowapi import Limiter
+# from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+load_dotenv()
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+)
+log = logging.getLogger("contract-api")
+
+# ── App setup ─────────────────────────────────────────────────────────────────
+app = FastAPI(
+    title="Contract Intelligence Platform",
+    description=(
+        "Transforms unstructured contract documents into standardised "
+        "NDA and SOW PDFs using Azure Content Understanding."
+    ),
+    version="1.0.0",
+)
+
+def get_api_key_for_limit(request: Request):
+    return request.headers.get("X-API-Key") or request.client.host
+limiter = Limiter(key_func=get_api_key_for_limit)
+app.state.limiter = limiter
+
+# Allow all origins locally — lock this down before production deployment
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.exception_handler(RateLimitExceeded)
+def rate_limit_handler(request,exc):
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "Rate limit exceeded"},
+    )
+# ── API Key auth ──────────────────────────────────────────────────────────────
+API_KEY        = os.getenv("CONTRACT_API_KEY", "GoldenEY1479")
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def verify_api_key(api_key: str = Security(API_KEY_HEADER)) -> str:
+    if api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    return api_key
+
+
+# ── Job storage (in-memory for local, swap for Redis/DB in production) ────────
+# Structure: { job_id: { status, created_at, file_name, error, outputs } }
+JOBS: dict = {}
+
+# Directories
+UPLOAD_DIR = Path("api_uploads")
+OUTPUT_DIR = Path("api_outputs")
+UPLOAD_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+# Supported file types
+SUPPORTED_TYPES = {
+    "application/pdf":                          ".pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/msword":                       ".doc",
+    "message/rfc822":                           ".eml",
+    "audio/mpeg":                               ".mp3",
+    "audio/wav":                                ".wav",
+    "audio/x-wav":                              ".wav",
+    "audio/mp4":                                ".m4a",
+}
+
+
+# ── Background pipeline runner ────────────────────────────────────────────────
+async def run_pipeline_job(job_id: str, file_path: str, contract_type: str):
+    """
+    Run the full pipeline in the background.
+    Updates JOBS[job_id] with status and output paths.
+    """
+    import asyncio
+
+    JOBS[job_id]["status"] = "processing"
+    log.info(f"[Job {job_id}] Pipeline starting — file={Path(file_path).name}")
+
+    try:
+        # Run pipeline in thread pool so it doesn't block the event loop
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            _run_pipeline_sync,
+            job_id,
+            file_path,
+            contract_type,
+        )
+        JOBS[job_id].update({
+            "status":     "complete",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "outputs":    result,
+        })
+        log.info(f"[Job {job_id}] Complete")
+
+    except Exception as e:
+        log.error(f"[Job {job_id}] Failed: {e}", exc_info=True)
+        JOBS[job_id].update({
+            "status": "failed",
+            "error":  str(e),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+def _run_pipeline_sync(job_id: str, file_path: str, contract_type: str) -> dict:
+    """
+    Synchronous pipeline execution (runs in thread pool).
+    Returns dict of output file paths.
+    """
+    import sys, json
+    ROOT = Path(__file__).resolve().parent
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+
+    from orchestration.functions.run_pipeline import run_pipeline
+    from generation.generate_contract_pdf import generate_pdf
+
+    job_output_dir = OUTPUT_DIR / job_id
+    job_output_dir.mkdir(exist_ok=True)
+
+    # Step 1 — Run extraction pipeline
+    canonical = run_pipeline(
+        input_path=file_path,
+        contract_type=contract_type,
+        upload_to_blob=True,
+    )
+
+    # Step 2 — Save canonical JSON
+    canonical_path = job_output_dir / "canonical.json"
+    with open(canonical_path, "w") as f:
+        json.dump(canonical, f, indent=2)
+
+    # Step 3 — Decide which docs to generate
+    outputs = {"canonical": str(canonical_path)}
+
+    if contract_type == "both":
+        generate_nda = True
+        generate_sow = True
+
+    elif contract_type == "nda":
+        generate_nda = True
+        generate_sow = False
+
+    elif contract_type == "sow":
+        generate_nda = False
+        generate_sow = True
+
+    else:  # "auto"
+        parties        = canonical.get("parties", {})
+        scope          = canonical.get("scope", {})
+        commercials    = canonical.get("commercials", {})
+        confidentiality = canonical.get("confidentiality", {})
+
+        nda_type = str(parties.get("ndaType", "")).lower()
+        has_nda_signal = (
+            "nda" in nda_type
+            or bool(confidentiality.get("term"))
+            or bool(confidentiality.get("exceptions"))
+            or bool(parties.get("disclosingParty"))
+        )
+        has_sow_signal = (
+            bool(scope.get("deliverables"))
+            or bool(scope.get("outOfScope"))
+            or bool(commercials.get("totalValue"))
+            or bool(commercials.get("milestones"))
+            or bool(commercials.get("paymentTerms"))
+        )
+
+        generate_nda = has_nda_signal
+        generate_sow = has_sow_signal
+
+        if not generate_nda and not generate_sow:
+            log.warning(f"[Job {job_id}] Auto-detect: no strong signals found — generating both as fallback")
+            generate_nda = True
+            generate_sow = True
+        else:
+            log.info(f"[Job {job_id}] Auto-detect: nda={generate_nda}, sow={generate_sow}")
+
+    # Step 4 — Generate only the decided doc(s)
+    if generate_nda:
+        nda_path = str(job_output_dir / "generated-nda.pdf")
+        generate_pdf(canonical, "nda", nda_path)
+        outputs["nda_pdf"] = nda_path
+        log.info(f"[Job {job_id}] NDA PDF generated")
+
+    if generate_sow:
+        sow_path = str(job_output_dir / "generated-sow.pdf")
+        generate_pdf(canonical, "sow", sow_path)
+        outputs["sow_pdf"] = sow_path
+        log.info(f"[Job {job_id}] SOW PDF generated")
+
+    return outputs
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.get("/health", tags=["System"])
+def health():
+    """Check API is running."""
+    return {
+        "status":  "ok",
+        "version": "1.0.0",
+        "time":    datetime.now(timezone.utc).isoformat(),
+    }
+
+@limiter.limit("5/minute")
+@app.post("/analyze", tags=["Pipeline"])
+async def analyze(
+    request: Request,
+    file:          UploadFile = File(..., description="Contract document to process"),
+    contract_type: str        = Form("auto", description="nda | sow | auto"),
+    _key:          str        = Security(verify_api_key),
+):
+    """
+    Upload a contract document and start the extraction pipeline.
+
+    Returns a job_id. Poll GET /jobs/{job_id} to check status.
+    When status = 'complete', download URLs will be included.
+
+    Supported formats: PDF, DOCX, EML, MP3, WAV, M4A
+    """
+    # Validate file type
+    content_type = file.content_type or ""
+    file_ext = Path(file.filename or "").suffix.lower()
+
+    allowed_extensions = {".pdf", ".docx", ".doc", ".eml", ".mp3", ".wav", ".m4a"}
+    if file_ext not in allowed_extensions:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported file type: {file_ext}. "
+                   f"Allowed: {sorted(allowed_extensions)}"
+        )
+
+    # Validate contract_type
+    if contract_type not in ("nda", "sow", "auto", "both"):
+        raise HTTPException(
+            status_code=422,
+            detail="contract_type must be 'nda', 'sow', or 'auto'"
+        )
+
+    # Save uploaded file
+    job_id    = str(uuid.uuid4())
+    safe_name = f"{job_id}{file_ext}"
+    file_path = UPLOAD_DIR / safe_name
+
+    with open(file_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    log.info(
+        f"[Job {job_id}] File received — "
+        f"name={file.filename}, size={file_path.stat().st_size} bytes"
+    )
+
+    # Register job
+    JOBS[job_id] = {
+        "job_id":       job_id,
+        "status":       "queued",
+        "created_at":   datetime.now(timezone.utc).isoformat(),
+        "file_name":    file.filename,
+        "contract_type": contract_type,
+        "outputs":      None,
+        "error":        None,
+    }
+
+    # Start pipeline in background
+    import asyncio
+    asyncio.create_task(
+        run_pipeline_job(job_id, str(file_path), contract_type)
+    )
+
+    return {
+        "job_id":      job_id,
+        "status":      "queued",
+        "message":     "Pipeline started. Poll /jobs/{job_id} for status.",
+        "poll_url":    f"/jobs/{job_id}",
+    }
+
+
+@app.get("/jobs/{job_id}", tags=["Pipeline"])
+def get_job(
+    job_id: str,
+    _key:   str = Security(verify_api_key),
+):
+    """
+    Get the status and results of a pipeline job.
+
+    Status values:
+    - queued      — waiting to start
+    - processing  — pipeline running
+    - complete    — finished, download URLs available
+    - failed      — error occurred, see 'error' field
+    """
+    if job_id not in JOBS:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    job = JOBS[job_id].copy()
+
+    # Add download URLs if complete
+    if job["status"] == "complete":
+        base = f"/download/{job_id}"
+        outputs = job.get("outputs") or {}
+        job["download_urls"] = {
+            k: f"{base}/{k.replace('_pdf','')}"
+            for k in outputs
+            if k.endswith("_pdf")
+        }
+
+    return job
+
+
+@app.get("/download/{job_id}/nda", tags=["Downloads"])
+def download_nda(
+    job_id: str,
+    _key:   str = Security(verify_api_key),
+):
+    """Download the generated NDA PDF for a completed job."""
+    _validate_download(job_id)
+    pdf_path = OUTPUT_DIR / job_id / "generated-nda.pdf"
+    if not pdf_path.exists():
+        raise HTTPException(status_code=404, detail="NDA PDF not found")
+
+    filename = _safe_filename(job_id, "nda")
+    return FileResponse(
+        path=str(pdf_path),
+        media_type="application/pdf",
+        filename=filename,
+    )
+
+
+@app.get("/download/{job_id}/sow", tags=["Downloads"])
+def download_sow(
+    job_id: str,
+    _key:   str = Security(verify_api_key),
+):
+    """Download the generated SOW PDF for a completed job."""
+    _validate_download(job_id)
+    pdf_path = OUTPUT_DIR / job_id / "generated-sow.pdf"
+    if not pdf_path.exists():
+        raise HTTPException(status_code=404, detail="SOW PDF not found")
+
+    filename = _safe_filename(job_id, "sow")
+    return FileResponse(
+        path=str(pdf_path),
+        media_type="application/pdf",
+        filename=filename,
+    )
+
+
+@app.get("/jobs", tags=["System"])
+def list_jobs(_key: str = Security(verify_api_key)):
+    """List all jobs and their current status."""
+    return {
+        "total": len(JOBS),
+        "jobs": [
+            {
+                "job_id":       j["job_id"],
+                "status":       j["status"],
+                "file_name":    j["file_name"],
+                "contract_type": j["contract_type"],
+                "created_at":   j["created_at"],
+            }
+            for j in JOBS.values()
+        ],
+    }
+
+
+@app.delete("/jobs/{job_id}", tags=["System"])
+def delete_job(
+    job_id: str,
+    _key:   str = Security(verify_api_key),
+):
+    """Delete a job and its associated files."""
+    if job_id not in JOBS:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    # Clean up files
+    job_output_dir = OUTPUT_DIR / job_id
+    if job_output_dir.exists():
+        shutil.rmtree(job_output_dir)
+
+    upload_file = next(UPLOAD_DIR.glob(f"{job_id}.*"), None)
+    if upload_file:
+        upload_file.unlink(missing_ok=True)
+
+    del JOBS[job_id]
+    return {"message": f"Job {job_id} deleted"}
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _validate_download(job_id: str):
+    if job_id not in JOBS:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    job = JOBS[job_id]
+    if job["status"] == "processing":
+        raise HTTPException(status_code=202, detail="Job still processing")
+    if job["status"] == "failed":
+        raise HTTPException(
+            status_code=500,
+            detail=f"Job failed: {job.get('error', 'unknown error')}"
+        )
+    if job["status"] != "complete":
+        raise HTTPException(status_code=400, detail=f"Job status: {job['status']}")
+
+
+def _safe_filename(job_id: str, doc_type: str) -> str:
+    """Generate a clean download filename from job metadata."""
+    job = JOBS.get(job_id, {})
+    original = Path(job.get("file_name", "contract")).stem
+    # Sanitise
+    safe = "".join(c for c in original if c.isalnum() or c in "-_ ")
+    safe = safe.strip()[:40] or "contract"
+    return f"{safe}-{doc_type}.pdf"
+
+@app.get("/download/{job_id}/canonical", tags=["Downloads"])
+def download_canonical(job_id: str, _key: str = Security(verify_api_key)):
+    canonical_path = OUTPUT_DIR / job_id / "canonical.json"
+    if not canonical_path.exists():
+        raise HTTPException(status_code=404, detail="Canonical JSON not found")
+    return FileResponse(
+        canonical_path,
+        media_type="application/json",
+        filename=f"{job_id}-canonical.json"
+    )
+
+
+@app.get("/download/{job_id}/source", tags=["Downloads"])
+def download_source(job_id: str, _key: str = Security(verify_api_key)):
+    """Return the original uploaded file so the frontend can preview it."""
+    if job_id not in JOBS:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    matches = list(UPLOAD_DIR.glob(f"{job_id}.*"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="Source file not found")
+
+    source_path = matches[0]
+    ext = source_path.suffix.lower()
+
+    mime_map = {
+        ".pdf":  "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".doc":  "application/msword",
+        ".eml":  "message/rfc822",
+        ".mp3":  "audio/mpeg",
+        ".wav":  "audio/wav",
+        ".m4a":  "audio/mp4",
+        ".txt":  "text/plain",
+    }
+    media_type = mime_map.get(ext, "application/octet-stream")
+    original_name = JOBS[job_id].get("file_name", f"source{ext}")
+
+    return FileResponse(
+        path=str(source_path),
+        media_type=media_type,
+        filename=original_name,
+    )
+
+
+# ── Regenerate ────────────────────────────────────────────────────────────────
+
+from pydantic import BaseModel
+from typing import List
+
+
+class RegenerateRequest(BaseModel):
+    overrides: dict
+    # Keys are field names (e.g. "confidentiality.term"), values are replacement strings.
+    dismissed_fields: List[str] = []
+    # Fields the user accepted as-is — these are REMOVED from canonical.conflicts
+    # so they no longer appear as conflicts after regeneration.
+
+
+@app.post("/jobs/{job_id}/regenerate", tags=["Pipeline"])
+async def regenerate_job(
+    job_id: str,
+    body: RegenerateRequest,
+    _key: str = Security(verify_api_key),
+):
+    """
+    Patch the saved canonical JSON with user-supplied overrides, remove
+    dismissed conflicts, and re-run ONLY the PDF generation step.
+
+    No Azure calls are made — extraction is skipped entirely.
+
+    POST body:
+        {
+          "overrides": { "field_name": "corrected_value" },
+          "dismissed_fields": ["field_name_1", "field_name_2"]
+        }
+
+    - overrides      — fields where the user picked an alternative or custom value
+    - dismissed_fields — fields where the user accepted the chosen value as correct;
+                         these are stripped from canonical.conflicts so they won't
+                         reappear as conflicts on the next load
+    """
+    if job_id not in JOBS:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    job = JOBS[job_id]
+    if job["status"] != "complete":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job must be 'complete' to regenerate. Current status: {job['status']}",
+        )
+
+    canonical_path = OUTPUT_DIR / job_id / "canonical.json"
+    if not canonical_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="canonical.json not found — was the original job completed successfully?",
+        )
+
+    # Re-queue the same job_id so frontend poll works as-is
+    JOBS[job_id]["status"] = "queued"
+    JOBS[job_id]["error"]  = None
+
+    import asyncio
+    asyncio.create_task(
+        _run_regenerate_job(
+            job_id,
+            str(canonical_path),
+            body.overrides,
+            body.dismissed_fields,
+            job.get("contract_type", "auto"),
+        )
+    )
+
+    return {
+        "job_id":              job_id,
+        "status":              "queued",
+        "message":             (
+            f"Regeneration queued with {len(body.overrides)} override(s) "
+            f"and {len(body.dismissed_fields)} dismissed conflict(s). "
+            f"Poll /jobs/{job_id}."
+        ),
+        "poll_url":            f"/jobs/{job_id}",
+        "overrides_applied":   list(body.overrides.keys()),
+        "conflicts_dismissed": body.dismissed_fields,
+    }
+
+
+async def _run_regenerate_job(
+    job_id: str,
+    canonical_path: str,
+    overrides: dict,
+    dismissed_fields: list,
+    contract_type: str,
+):
+    """Background task: patch canonical → remove dismissed conflicts → regenerate PDFs."""
+    import asyncio
+    JOBS[job_id]["status"] = "processing"
+    log.info(
+        f"[Job {job_id}] Regenerating — "
+        f"overrides: {list(overrides.keys())} | dismissed: {dismissed_fields}"
+    )
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            _regenerate_sync,
+            job_id,
+            canonical_path,
+            overrides,
+            dismissed_fields,
+            contract_type,
+        )
+        JOBS[job_id].update({
+            "status":       "complete",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "outputs":      result,
+        })
+        log.info(f"[Job {job_id}] Regeneration complete")
+    except Exception as e:
+        log.error(f"[Job {job_id}] Regeneration failed: {e}", exc_info=True)
+        JOBS[job_id].update({
+            "status":       "failed",
+            "error":        str(e),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+
+def _set_nested(d: dict, dot_path: str, value):
+    """Set a value in a nested dict using dot notation. e.g. 'parties.client.name'"""
+    keys = dot_path.split(".")
+    for key in keys[:-1]:
+        d = d.setdefault(key, {})
+    d[keys[-1]] = value
+
+
+def _regenerate_sync(
+    job_id: str,
+    canonical_path: str,
+    overrides: dict,
+    dismissed_fields: list,
+    contract_type: str,
+) -> dict:
+    """
+    1. Load saved canonical.json
+    2. Remove dismissed conflicts from canonical["conflicts"]
+    3. Apply field overrides (dot-notation)
+    4. Save updated canonical.json
+    5. Regenerate PDFs
+    """
+    import sys, json
+    ROOT = Path(__file__).resolve().parent
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+
+    from generation.generate_contract_pdf import generate_pdf
+
+    job_output_dir = OUTPUT_DIR / job_id
+
+    # ── Step 1: Load canonical ────────────────────────────────────────────────
+    with open(canonical_path, "r") as f:
+        canonical = json.load(f)
+
+    # ── Step 2: Remove dismissed conflicts ───────────────────────────────────
+    # The user accepted these fields as correct — strip them from the conflicts
+    # array so they don't reappear as unresolved conflicts on the next load.
+    if dismissed_fields:
+        dismissed_set = set(dismissed_fields)
+        original_conflicts = canonical.get("conflicts", [])
+        canonical["conflicts"] = [
+            c for c in original_conflicts
+            if c.get("field", "") not in dismissed_set
+        ]
+        removed = len(original_conflicts) - len(canonical["conflicts"])
+        log.info(f"[Job {job_id}] Removed {removed} dismissed conflict(s) from canonical")
+
+    # ── Step 3: Apply field overrides ────────────────────────────────────────
+    # Also remove overridden fields from conflicts — if the user picked an
+    # alternative value, that conflict is resolved too.
+    if overrides:
+        overridden_fields = set(overrides.keys())
+        canonical["conflicts"] = [
+            c for c in canonical.get("conflicts", [])
+            if c.get("field", "") not in overridden_fields
+        ]
+        for dot_path, value in overrides.items():
+            try:
+                _set_nested(canonical, dot_path, value)
+                log.info(f"[Job {job_id}] Override applied: {dot_path} = {str(value)[:60]}")
+            except Exception as e:
+                log.warning(f"[Job {job_id}] Could not apply override '{dot_path}': {e}")
+
+    # ── Step 3b: Remove filled fields from missingFields ────────────────────
+    # When overrides contain a key that matches a missing field, that field is
+    # no longer missing — remove it from both "missingFields" and "missing_fields"
+    # (the canonical uses both keys depending on the extraction version).
+    if overrides:
+        filled_keys = set(overrides.keys())
+        for mf_key in ("missingFields", "missing_fields"):
+            existing = canonical.get(mf_key)
+            if not existing:
+                continue
+            if isinstance(existing, list):
+                cleaned = []
+                for entry in existing:
+                    # entry may be a plain string or a dict with a "field" key
+                    if isinstance(entry, str):
+                        # Match against the last segment of the dot-path too
+                        # e.g. override key "dates.effectiveDate" should clear "effectiveDate"
+                        if not any(
+                            entry == k or entry == k.split(".")[-1] or k.endswith("." + entry)
+                            for k in filled_keys
+                        ):
+                            cleaned.append(entry)
+                    elif isinstance(entry, dict):
+                        field_name = entry.get("field", "")
+                        if not any(
+                            field_name == k or field_name == k.split(".")[-1] or k.endswith("." + field_name)
+                            for k in filled_keys
+                        ):
+                            cleaned.append(entry)
+                    else:
+                        cleaned.append(entry)
+                removed_mf = len(existing) - len(cleaned)
+                if removed_mf:
+                    canonical[mf_key] = cleaned
+                    log.info(f"[Job {job_id}] Removed {removed_mf} filled field(s) from {mf_key}")
+
+    # ── Step 4: Save updated canonical ───────────────────────────────────────
+    with open(canonical_path, "w") as f:
+        json.dump(canonical, f, indent=2)
+    log.info(f"[Job {job_id}] canonical.json updated and saved")
+
+    # ── Step 5: Regenerate PDFs ───────────────────────────────────────────────
+    outputs = {"canonical": canonical_path}
+
+    # Determine which docs to regenerate based on contract_type
+    if contract_type == "both":
+        generate_nda, generate_sow = True, True
+    elif contract_type == "nda":
+        generate_nda, generate_sow = True, False
+    elif contract_type == "sow":
+        generate_nda, generate_sow = False, True
+    else:  # auto — use same heuristics as original pipeline
+        parties         = canonical.get("parties", {})
+        scope           = canonical.get("scope", {})
+        commercials     = canonical.get("commercials", {})
+        confidentiality = canonical.get("confidentiality", {})
+
+        nda_type = str(parties.get("ndaType", "")).lower()
+        generate_nda = (
+            "nda" in nda_type
+            or bool(confidentiality.get("term"))
+            or bool(confidentiality.get("exceptions"))
+            or bool(parties.get("disclosingParty"))
+        )
+        generate_sow = (
+            bool(scope.get("deliverables"))
+            or bool(scope.get("outOfScope"))
+            or bool(commercials.get("totalValue"))
+            or bool(commercials.get("milestones"))
+            or bool(commercials.get("paymentTerms"))
+        )
+        if not generate_nda and not generate_sow:
+            generate_nda = generate_sow = True
+
+    if generate_nda:
+        nda_path = str(job_output_dir / "generated-nda.pdf")
+        generate_pdf(canonical, "nda", nda_path)
+        outputs["nda_pdf"] = nda_path
+        log.info(f"[Job {job_id}] NDA PDF regenerated")
+
+    if generate_sow:
+        sow_path = str(job_output_dir / "generated-sow.pdf")
+        generate_pdf(canonical, "sow", sow_path)
+        outputs["sow_pdf"] = sow_path
+        log.info(f"[Job {job_id}] SOW PDF regenerated")
+
+    return outputs
+
+
+if __name__ == "__main__":
+    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
+
+2. requirements.txt:
+
+# requirements.txt
+# Core pipeline dependencies
+
+# Azure SDKs
+azure-storage-blob>=12.19.0          # Blob Storage (already partial)
+azure-ai-documentintelligence>=1.0.0 # Content Understanding / Document Intelligence
+# azure-cognitiveservices-speech>=1.35.0 # Speech-to-text (need to provision)
+# openai>=1.30.0                        # Azure OpenAI GPT-4o (need to provision)
+
+# DOCX → PDF conversion (try these in order)
+python-docx>=1.1.0                   # Read/manipulate DOCX files
+docx2pdf>=0.1.8                      # DOCX → PDF (works best on Windows/Mac)
+pypandoc>=1.13                        # Alternative DOCX → PDF (needs pandoc + LaTeX)
+# LibreOffice is installed separately (apt install libreoffice) for Linux
+
+# Email parsing
+extract-msg>=0.48.0                  # Outlook .msg file parser
+
+# Schema & config
+pyyaml>=6.0.1                        # Parse mapping-matrix.yaml + precedence-rules.yaml
+jsonschema>=4.22.0                   # Validate against contract-package.schema.json
+python-dotenv>=1.0.0                 # Load .env file
+
+# API server (optional — for HTTP endpoint)
+fastapi>=0.111.0
+uvicorn>=0.30.0
+
+# Dev/testing
+pytest>=8.2.0
+pytest-asyncio>=0.23.0
+
+3. config/azure_clients.py:
+
+"""
+azure_clients.py
+─────────────────
+Centralised Azure service client factory.
+
+All credentials come from environment variables — never hardcoded.
+Copy .env.example to .env and fill in your values.
+
+Required env vars:
+    AZURE_CU_ENDPOINT          Content Understanding endpoint URL
+    AZURE_CU_KEY               Content Understanding API key
+    AZURE_BLOB_CONNECTION_STR  Storage account connection string
+    AZURE_OPENAI_ENDPOINT      Azure OpenAI endpoint URL
+    AZURE_OPENAI_KEY           Azure OpenAI API key
+    AZURE_OPENAI_DEPLOYMENT    GPT-4o deployment name (e.g. "gpt-4o")
+    AZURE_SPEECH_KEY           Speech Services subscription key
+    AZURE_SPEECH_REGION        Speech Services region (e.g. "uksouth")
+"""
+
+import os
+import logging
+from functools import lru_cache
+
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv())
+
+log = logging.getLogger(__name__)
+
+
+def _require_env(key: str) -> str:
+    """Get env var or raise a clear error."""
+    val = os.getenv(key)
+    if not val:
+        raise EnvironmentError(
+            f"Missing required environment variable: {key}\n"
+            f"Add it to your .env file. See .env.example for all required vars."
+        )
+    return val
+
+
+@lru_cache(maxsize=1)
+def get_cu_client():
+    """
+    Azure Content Understanding / Document Intelligence client.
+    pip install azure-ai-documentintelligence
+    """
+    endpoint = _require_env("AZURE_CU_ENDPOINT")
+    key = _require_env("AZURE_CU_KEY")
+
+    from azure.ai.documentintelligence import DocumentIntelligenceClient
+    from azure.core.credentials import AzureKeyCredential
+    return DocumentIntelligenceClient(endpoint=endpoint, credential=AzureKeyCredential(key))
+
+
+@lru_cache(maxsize=1)
+def get_blob_client():
+    """
+    Azure Blob Storage client.
+    pip install azure-storage-blob
+    """
+    connection_str = _require_env("AZURE_BLOB_CONNECTION_STR")
+
+    from azure.storage.blob import BlobServiceClient
+    return BlobServiceClient.from_connection_string(connection_str)
+
+
+@lru_cache(maxsize=1)
+def get_openai_client():
+    """
+    Azure OpenAI client for GPT-4o extraction.
+    pip install openai
+    """
+    endpoint = _require_env("AZURE_OPENAI_ENDPOINT")
+    key = _require_env("AZURE_OPENAI_KEY")
+
+    from openai import AzureOpenAI
+    return AzureOpenAI(
+        azure_endpoint=endpoint,
+        api_key=key,
+        api_version="2024-12-01-preview",
+    )
+
+
+@lru_cache(maxsize=1)
+def get_speech_config():
+    """
+    Azure Speech Services config for audio transcription.
+    pip install azure-cognitiveservices-speech
+
+    Free tier: 5 hours/month transcription.
+    Enable: Azure Portal → Create Resource → Speech.
+    """
+    key = _require_env("AZURE_SPEECH_KEY")
+    region = _require_env("AZURE_SPEECH_REGION")
+
+    import azure.cognitiveservices.speech as speechsdk
+    config = speechsdk.SpeechConfig(subscription=key, region=region)
+    config.speech_recognition_language = "en-US"
+    # Output detailed results so we can pull full text from all segments
+    config.output_format = speechsdk.OutputFormat.Detailed
+    return config
+
+
+def get_speech_endpoint() -> tuple[str, str]:
+    """
+    Return (key, region) for use with the Speech batch REST API.
+    Separate from get_speech_config() because batch API uses raw HTTP,
+    not the SDK config object.
+    """
+    key = _require_env("AZURE_SPEECH_KEY")
+    region = _require_env("AZURE_SPEECH_REGION")
+    return key, region
+
+
+def get_openai_deployment() -> str:
+    """Return the configured GPT-4o deployment name."""
+    return os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+
+4. orchestration/functions/run_pipeline.py:
+
+"""
+run_pipeline.py
+───────────────
+ENTRY POINT for the full contract processing pipeline.
+
+Accepts any supported input file, routes it to the correct
+modality handler, runs the appropriate CU analyzer(s) or
+LLM extractor, maps to canonical schema, merges conflicts,
+and returns a validated contract package.
+
+Usage:
+    python run_pipeline.py --input path/to/file.pdf --type nda
+    python run_pipeline.py --input path/to/email.eml
+    python run_pipeline.py --input path/to/call.mp3
+"""
+
+import argparse
+import json
+import logging
+from dotenv import load_dotenv
+load_dotenv()
+import sys
+from pathlib import Path
+from typing import Literal
+
+# Ensure package imports work when executing script directly from project root.
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from orchestration.functions.map_to_canonical import map_to_canonical
+from orchestration.functions.merge_engine import merge_results
+from generation.generate_contract_pdf import generate_pdf
+from normalization.pdf_handler import handle_pdf
+from normalization.docx_handler import handle_docx
+from normalization.email_handler import handle_email
+from normalization.audio_handler import handle_audio
+from validators.schema_validator import validate_canonical_package
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
+
+# Supported input types and their handlers
+MODALITY_ROUTER = {
+    ".pdf":  handle_pdf,
+    ".docx": handle_docx,
+    ".doc":  handle_docx,
+    ".eml":  handle_email,
+    ".msg":  handle_email,
+    ".mp3":  handle_audio,
+    ".wav":  handle_audio,
+    ".m4a":  handle_audio,
+}
+
+ContractType = Literal["nda", "sow", "auto"]
+
+
+def run_pipeline(
+    input_path: str,
+    contract_type: ContractType = "auto",
+    upload_to_blob: bool = True,
+) -> dict:
+    """
+    Main pipeline entry point.
+
+    Args:
+        input_path:     Local path to the input file.
+        contract_type:  "nda" | "sow" | "auto" (auto-detected from content).
+        upload_to_blob: Whether to stage file in Azure Blob before processing.
+
+    Returns:
+        A validated canonical contract package (dict matching schema).
+    """
+    path = Path(input_path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Input file does not exist: {input_path}. "
+            "Verify the path and try again."
+        )
+
+    ext = path.suffix.lower()
+    if ext not in MODALITY_ROUTER:
+        raise ValueError(f"Unsupported file type: {ext}. Supported: {list(MODALITY_ROUTER)}")
+
+    log.info(f"[Pipeline] Starting — file={path.name}, type={contract_type}")
+
+    
+    # ── Step 1: Route to modality handler ────────────────────────────────────
+    handler = MODALITY_ROUTER[ext] 
+    raw_results: list[dict] = handler( 
+        file_path=str(path), 
+        contract_type=contract_type, 
+        upload_to_blob=upload_to_blob, ) 
+    log.info(f"[Pipeline] Extraction complete — {len(raw_results)} result(s) from handler")
+
+    # ── Step 2: Map each result to canonical schema fields ───────────────────
+    canonical_candidates: list[dict] = []
+    for result in raw_results:
+        mapped = map_to_canonical(result)
+        canonical_candidates.append(mapped)
+
+    # ── Step 3: Merge + apply precedence rules ────────────────────────────────
+    merged_package = merge_results(canonical_candidates)
+    log.info("[Pipeline] Merge complete")
+
+    # ── Step 4: Validate against canonical schema ─────────────────────────────
+    is_valid, errors = validate_canonical_package(merged_package)
+    if not is_valid:
+        log.warning(f"[Pipeline] Schema validation warnings: {errors}")
+        merged_package["_validationErrors"] = errors
+    else:
+        log.info("[Pipeline] Schema validation passed")
+
+    return merged_package
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Contract Processing Pipeline")
+    parser.add_argument("--input", required=True, help="Path to input file")
+    parser.add_argument("--type", default="auto", choices=["nda", "sow", "auto"])
+    parser.add_argument("--no-blob", action="store_true", help="Skip Blob Storage upload")
+    parser.add_argument("--output", help="Save canonical JSON to this file path")
+    parser.add_argument("--generate", action="store_true",
+                        help="Generate single PDF contract after extraction")
+    parser.add_argument("--output-pdf", help="Path for generated PDF (requires --generate)")
+    parser.add_argument("--generate-both", action="store_true",
+                        help="Generate both NDA and SOW PDFs after extraction")
+    parser.add_argument("--output-dir", default="tests/output",
+                        help="Output directory for --generate-both (default: tests/output)")
+    args = parser.parse_args()
+
+    result = run_pipeline(
+        input_path=args.input,
+        contract_type=args.type,
+        upload_to_blob=not args.no_blob,
+    )
+
+    # Save canonical JSON
+    if args.output:
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        with open(args.output, "w") as f:
+            json.dump(result, f, indent=2)
+        log.info(f"[Pipeline] Canonical JSON saved to {args.output}")
+    else:
+        print(json.dumps(result, indent=2))
+
+    # Generate single PDF
+    if args.generate:
+        contract_type = args.type if args.type != "auto" else "nda"
+        pdf_path = args.output_pdf or (
+            args.output.replace(".json", f"-{contract_type}.pdf")
+            if args.output else f"tests/output/generated-{contract_type}.pdf"
+        )
+        generate_pdf(result, contract_type, pdf_path)
+        log.info(f"[Pipeline] PDF generated: {pdf_path}")
+
+    # Generate both NDA and SOW PDFs
+    if args.generate_both:
+        out_dir = Path(args.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Derive base name from input file
+        base = Path(args.input).stem
+
+        nda_path = str(out_dir / f"{base}-nda.pdf")
+        sow_path = str(out_dir / f"{base}-sow.pdf")
+
+        generate_pdf(result, "nda", nda_path)
+        log.info(f"[Pipeline] NDA PDF generated: {nda_path}")
+
+        generate_pdf(result, "sow", sow_path)
+        log.info(f"[Pipeline] SOW PDF generated: {sow_path}")
+
+        log.info(f"[Pipeline] Both documents saved to {out_dir}/")
+
+5. orchestration/functions/merge_engine.py:
+
+"""
+merge_engine.py
+───────────────
+Merges multiple canonical candidate dicts (from different analyzers
+or modality sources) into a single final contract package.
+
+Applies precedence rules from precedence-rules.yaml to resolve
+field-level conflicts when multiple sources provide different values.
+
+Expected precedence-rules.yaml format:
+    source_priority:
+      - signed_document      # highest trust
+      - final_draft
+      - cu_analyzer          # your CU extractions
+      - llm_email
+      - llm_audio
+      - notes                # lowest trust
+
+    field_overrides:         # optional per-field rules
+      parties.client.name:
+        prefer: cu_analyzer  # always trust CU for this field
+      commercials.totalValue:
+        prefer: signed_document
+"""
+
+import yaml
+import logging
+from copy import deepcopy
+from pathlib import Path
+from typing import Any
+
+from orchestration.functions.map_to_canonical import build_empty_canonical, get_nested, set_nested
+
+log = logging.getLogger(__name__)
+
+PRECEDENCE_RULES_PATH = Path(__file__).parent.parent.parent / "canonical" / "precedence-rules.yaml"
+
+# Maps _source values to their tier names in precedence-rules.yaml
+SOURCE_TO_TIER = {
+    "deal_intake":    "cu_analyzer",
+    "nda":            "cu_analyzer",
+    "sow":            "cu_analyzer",
+    "llm_email":      "llm_email",
+    "llm_audio":      "llm_audio",
+    "signed_document": "signed_document",
+    "final_draft":    "final_draft",
+}
+
+
+def load_precedence_rules() -> dict:
+    """Load precedence-rules.yaml."""
+    # TODO: Add caching
+    with open(PRECEDENCE_RULES_PATH, "r") as f:
+        return yaml.safe_load(f)
+
+
+def get_source_priority(rules: dict) -> list[str]:
+    """Return ordered list of source tiers, highest priority first."""
+    return rules.get("source_priority", [
+        "signed_document",
+        "final_draft",
+        "cu_analyzer",
+        "llm_email",
+        "llm_audio",
+        "notes",
+    ])
+
+
+def get_tier(source: str) -> str:
+    """Map a raw _source string to its precedence tier."""
+    return SOURCE_TO_TIER.get(source, source)
+
+# Keys that are structural — never treat as missing data fields
+STRUCTURAL_KEYS = {
+    "missingFields", "conflicts", "provenance", "risks"
+}
+
+def collect_all_dot_paths(d: dict, prefix: str = "") -> list[str]:
+    """
+    Walk a nested dict and return all dot-notation leaf paths.
+    Skips internal metadata keys and structural keys.
+    """
+    paths = []
+    for key, val in d.items():
+        if key.startswith("_") or key in STRUCTURAL_KEYS:
+            continue
+        full_key = f"{prefix}.{key}" if prefix else key
+        if isinstance(val, dict):
+            paths.extend(collect_all_dot_paths(val, full_key))
+        else:
+            paths.append(full_key)
+    return paths
+
+def merge_results(candidates: list[dict]) -> dict:
+    """
+    Merge a list of canonical candidate dicts into one final package.
+
+    For each field in the canonical schema:
+    1. Collect all non-empty values across candidates
+    2. If only one value exists → use it, record provenance
+    3. If multiple agree → use it, record provenance
+    4. If multiple conflict → apply precedence rules, record conflict
+
+    Args:
+        candidates: List of mapped canonical dicts, each with a "_source" key.
+
+    Returns:
+        A single merged canonical package with conflicts and provenance recorded.
+    """
+    rules = load_precedence_rules()
+    priority_order = get_source_priority(rules)
+    field_overrides = rules.get("field_overrides", {})
+
+    merged = build_empty_canonical()
+
+    # Gather all field paths from the canonical schema
+    all_paths = collect_all_dot_paths(merged)
+
+    for path in all_paths:
+        # Collect (value, source, confidence, rule_precedence) from each candidate that has this field
+        contributions = []
+        for candidate in candidates:
+            val = get_nested(candidate, path)
+            if val is not None and val != "" and val != []:
+                rule_prec = candidate.get("_rule_precedence", {}).get(path, 0)
+                contributions.append({
+                    "value": val,
+                    "source": candidate.get("_source", "unknown"),
+                    "confidence": candidate.get("_confidence", 0.0),
+                    "rule_precedence": rule_prec,
+                })
+
+        if not contributions:
+            # No source has this field — add to missingFields
+            if path not in merged["missingFields"]:
+                merged["missingFields"].append(path)
+            continue
+
+        if len(contributions) == 1:
+            # Only one source — use it directly
+            set_nested(merged, path, contributions[0]["value"])
+            _record_provenance(merged, path, contributions[0])
+            continue
+
+        # Multiple sources — check if they agree
+        unique_values = {str(c["value"]) for c in contributions}
+        if len(unique_values) == 1:
+            # All agree — use the highest-confidence source
+            best = _pick_by_priority(contributions, priority_order, field_overrides, path)
+            set_nested(merged, path, best["value"])
+            _record_provenance(merged, path, best)
+            continue
+
+        # Conflict — apply precedence rules
+        best = _pick_by_priority(contributions, priority_order, field_overrides, path)
+        set_nested(merged, path, best["value"])
+        _record_provenance(merged, path, best)
+
+        # Record the conflict for review
+        conflict = {
+            "field": path,
+            "chosen": best["value"],
+            "chosenSource": best["source"],
+            "alternatives": [
+                {"value": c["value"], "source": c["source"]}
+                for c in contributions
+                if c["source"] != best["source"]
+            ],
+        }
+        merged["conflicts"].append(conflict)
+        log.info(f"[Merge] Conflict on '{path}' — chose {best['source']!r} over {[c['source'] for c in contributions if c['source'] != best['source']]}")
+
+    # Set review status based on what was found
+    _set_review_status(merged)
+
+    return merged
+
+
+def _pick_by_priority(
+    contributions: list[dict],
+    priority_order: list[str],
+    field_overrides: dict,
+    path: str,
+) -> dict:
+    """
+    Pick the best contribution for a field based on precedence rules.
+    Respects field-level overrides if defined.
+    Uses rule-level precedence as tie-breaker when multiple sources 
+    are from the same tier.
+    """
+    # Check for a field-specific override
+    if path in field_overrides:
+        override_rule = field_overrides[path]
+        
+        # Check for source-level preference (prefer_source or prefer)
+        preferred_source = override_rule.get("prefer_source") or override_rule.get("prefer")
+        if preferred_source:
+            # First, check if prefer matches a source name directly
+            for c in contributions:
+                if c["source"] == preferred_source:
+                    return c
+            # If not found as source, try as tier name
+            for c in contributions:
+                if get_tier(c["source"]) == preferred_source:
+                    return c
+
+    # Fall back to global priority order, using rule precedence as tie-breaker
+    for tier in priority_order:
+        tier_contributions = [c for c in contributions if get_tier(c["source"]) == tier]
+        if tier_contributions:
+            if len(tier_contributions) == 1:
+                return tier_contributions[0]
+            # Multiple sources in same tier — use rule precedence (higher wins)
+            best = max(tier_contributions, key=lambda c: c.get("rule_precedence", 0))
+            return best
+
+    # Last resort: highest confidence
+    return max(contributions, key=lambda c: c["confidence"])
+
+
+def _record_provenance(merged: dict, path: str, contribution: dict) -> None:
+    """Append a provenance entry for a resolved field."""
+    entry = {
+        "canonicalPath": path,
+        "value": str(contribution["value"]) if not isinstance(contribution["value"], list) else "; ".join(str(i) for i in contribution["value"])[:120],
+        "sourceDocumentId": "",  # TODO: populate from blob storage URL
+        "sourceField": contribution["source"],
+        "sourceFamily": get_tier(contribution["source"]),
+        "confidence": contribution["confidence"],
+    }
+    merged["provenance"].append(entry)
+
+
+def _set_review_status(merged: dict) -> None:
+    """
+    Set the review.status and reviewReason based on pipeline results.
+    - "auto"         → clean extraction, no conflicts, no missing fields
+    - "needs_review" → conflicts found or critical fields missing
+    - "approved"     → set manually downstream
+    """
+    reasons = []
+
+    if merged["conflicts"]:
+        reasons.append(f"{len(merged['conflicts'])} field conflict(s) found")
+
+    critical_fields = [
+        "parties.client.name",
+        "parties.vendor.name",
+        "dates.effectiveDate",
+    ]
+    missing_critical = [f for f in critical_fields if f in merged["missingFields"]]
+    if missing_critical:
+        reasons.append(f"Critical fields missing: {missing_critical}")
+
+    if reasons:
+        merged["review"]["status"] = "needs_review"
+        merged["review"]["reviewReason"] = reasons
+    else:
+        merged["review"]["status"] = "auto"
+
+    # Remove review.* from missingFields — set programmatically not extracted
+    merged["missingFields"] = [
+        f for f in merged["missingFields"]
+        if not f.startswith("review.")
+    ]
+
+6. orchestration/functions/map_to_canonical.py:
+
+"""
+map_to_canonical.py
+────────────────────
+Translates raw analyzer output into the canonical schema.
+Uses mapping-matrix.yaml as the translation ruleset.
+"""
+import yaml, logging
+from pathlib import Path
+from typing import Any
+
+log = logging.getLogger(__name__)
+MAPPING_MATRIX_PATH = Path(__file__).parent.parent.parent / "canonical" / "mapping-matrix.yaml"
+
+
+def apply_transform(value: Any, transform: str) -> Any:
+    if transform == "as_is" or not transform:
+        return value
+
+    if transform == "parse_party_client":
+        for segment in str(value).split("||"):
+            if "ROLE::client" in segment:
+                for part in segment.split("|"):
+                    if part.strip().startswith("PARTY::"):
+                        return part.strip().replace("PARTY::", "").strip()
+        return value
+
+    if transform == "parse_party_vendor":
+        for segment in str(value).split("||"):
+            if "ROLE::vendor" in segment:
+                for part in segment.split("|"):
+                    if part.strip().startswith("PARTY::"):
+                        return part.strip().replace("PARTY::", "").strip()
+        return value
+
+    if transform == "parse_deliverables_composite":
+        if isinstance(value, str):
+            items = []
+            for line in value.split("\n"):
+                if line.strip().startswith("DELIV::"):
+                    deliv = line.strip().replace("DELIV::", "").strip()
+                    if deliv and deliv.lower() != "null":
+                        items.append(deliv)
+            return items if items else value
+        return value
+
+    if transform == "parse_signers":
+        if not value or not str(value).strip():
+            return []
+        signers = []
+        for block in str(value).split("\n\n"):
+            signer = {}
+            for line in block.strip().split("\n"):
+                line = line.strip()
+                if line.startswith("SIGNER::"):
+                    signer["name"] = line.replace("SIGNER::", "").strip()
+                elif line.startswith("PARTY::"):
+                    signer["party"] = line.replace("PARTY::", "").strip()
+                elif line.startswith("TITLE::"):
+                    signer["title"] = line.replace("TITLE::", "").strip()
+                elif line.startswith("DATE::"):
+                    signer["date"] = line.replace("DATE::", "").strip()
+            if signer.get("name"):
+                signers.append(signer)
+        return signers
+
+    log.warning(f"[Mapper] Unknown transform '{transform}' — using as_is")
+    return value
+
+
+def load_mapping_matrix() -> dict:
+    with open(MAPPING_MATRIX_PATH, "r") as f:
+        return yaml.safe_load(f)
+
+
+def set_nested(target: dict, dotted_key: str, value: Any) -> None:
+    keys = dotted_key.split(".")
+    cursor = target
+    for key in keys[:-1]:
+        cursor = cursor.setdefault(key, {})
+    cursor[keys[-1]] = value
+
+
+def get_nested(source: dict, dotted_key: str, default=None) -> Any:
+    keys = dotted_key.split(".")
+    cursor = source
+    for key in keys:
+        if not isinstance(cursor, dict) or key not in cursor:
+            return default
+        cursor = cursor[key]
+    return cursor
+
+
+def map_to_canonical(raw_result: dict) -> dict:
+    matrix = load_mapping_matrix()
+    source = raw_result.get("_source") or raw_result.get("_analyzerUsed", "unknown")
+    mappings = matrix.get("mappings", [])
+
+    if not isinstance(mappings, list):
+        log.warning("[Mapper] Unexpected mapping format — expected list")
+        return {"_raw": raw_result, "_source": source, "_mapped": False}
+
+    canonical = {
+        "_source": source,
+        "_mapped": True,
+        "_confidence": raw_result.get("_confidence", 0.0),
+        "_rule_precedence": {},
+    }
+
+    for rule in mappings:
+        if rule.get("sourceAnalyzer") != source:
+            continue
+        source_field   = rule.get("sourceField")
+        canonical_path = rule.get("canonicalPath")
+        transform      = rule.get("transform", "as_is")
+        precedence     = rule.get("precedence", 0)
+
+        if not source_field or not canonical_path:
+            continue
+        value = raw_result.get(source_field)
+        if value is None:
+            continue
+
+        value = apply_transform(value, transform)
+        set_nested(canonical, canonical_path, value)
+        canonical["_rule_precedence"][canonical_path] = precedence
+        log.debug(f"[Mapper] {source_field} → {canonical_path}")
+
+    return canonical
+
+
+def build_empty_canonical() -> dict:
+    return {
+        "parties": {
+            "client":  {"name": "", "signatories": []},
+            "vendor":  {"name": "", "signatories": []},
+            "ndaType": "",
+        },
+        "dates": {
+            "effectiveDate":  "",
+            "expirationDate": "",
+            "executionDate":  "",
+        },
+        "scope": {
+            "description":   "",
+            "deliverables":  [],
+            "outOfScope":    [],
+            "milestones":    [],
+            "sowReferenceId": "",
+            "locationAndTravel": "",
+        },
+        "confidentiality": {
+            "term":        "",
+            "obligations": [],
+            "exceptions":  [],
+        },
+        "commercials": {
+            "totalValue":   "",
+            "paymentTerms": "",
+            "currency":     "",
+            "pricingModel": "",
+            "taxes":        "",
+            "expenses":     "",
+        },
+        "security": {
+            "requirements":          "",
+            "dataResidency":         "",
+            "complianceStandards":   "",
+            "personalDataProcessing":"",
+            "privacyRequirements":   "",
+        },
+        "legal": {
+            "governingLaw":            "",
+            "jurisdiction":            "",
+            "disputeResolution":       "",
+            "liabilityCap":            "",
+            "ipOwnership":             "",
+            "warranties":              "",
+            "indemnities":             "",
+            "terminationForConvenience":"",
+            "terminationForCause":     "",
+            "injunctiveRelief":        "",
+            "licenseGrants":           "",
+            "thirdPartySoftware":      "",
+            "msaReference":            "",
+            "serviceLevels":           "",
+        },
+        "projectGovernance": {
+            "acceptanceCriteria":  "",
+            "acceptanceTimeline":  "",
+            "changeControl":       "",
+            "issueEscalation":     "",
+            "governanceModel":     "",
+            "projectTimeline":     "",
+            "keyPersonnel":        "",
+            "dependencies":        "",
+            "assumptions":         "",
+            "constraints":         "",
+        },
+        "risks":        [],
+        "missingFields":[],
+        "conflicts":    [],
+        "provenance":   [],
+        "review": {
+            "status":       "needs_review",
+            "reviewReason": [],
+            "reviewedBy":   "",
+            "reviewedAt":   "",
+        },
+    }
+
+def apply_mapping(facts_by_source: dict[str, list[dict]]) -> list[dict]:
+    """
+    Apply mapping to a batch of raw records grouped by source analyzer.
+    Returns a flat list of mapped canonical candidates, one per input record.
+    Example facts_by_source:
+        {
+          "llm_audio": [ {...}, {...} ],
+          "nda":       [ {...} ]
+        }
+    """
+    candidates: list[dict] = []
+    for source, records in (facts_by_source or {}).items():
+        for rec in records:
+            # ensure _source is set (mapper uses it to select rules)
+            if "_source" not in rec:
+                rec["_source"] = source
+            mapped = map_to_canonical(rec)
+            candidates.append(mapped)
+    return candidates
